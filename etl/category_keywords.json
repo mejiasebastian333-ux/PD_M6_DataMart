@@ -1,0 +1,7 @@
+{
+  "Papeleria": ["CARD", "NOTEBOOK", "PENCIL", "ENVELOPE", "STICKER", "WRAP", "PAPER", "STATIONERY", "POSTCARD", "BOOKMARK", "GIFT TAG"],
+  "Ropa": ["T-SHIRT", "SCARF", "HAT", "GLOVE", "SOCK", "APRON"],
+  "Deportes": ["BALL", "GAME", "SPORT", "BICYCLE", "SKATE", "YOGA"],
+  "Electronica": ["RADIO", "CAMERA", "BATTERY", "CABLE", "USB", "PHONE"],
+  "Hogar": ["CANDLE", "HOLDER", "LANTERN", "MUG", "CUP", "JUG", "PLATE", "BOWL", "TIN", "BOX", "LIGHT", "CLOCK", "FRAME", "DOORMAT", "CUSHION", "SIGN", "DECORATION", "VASE", "BASKET", "HOOK", "MIRROR", "RUG", "TOWEL", "KITCHEN", "GARDEN", "PLANT", "CHRISTMAS", "HEART"]
+}

@@ -1,0 +1,143 @@
+# Bloque reutilizable (YAML anchor) con la configuracion comun a los 3 servicios
+# de Airflow (init/webserver/scheduler), para no repetirla 3 veces.
+x-airflow-common: &airflow-common
+  image: apache/airflow:2.10.3
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${AIRFLOW_DB_USER}:${AIRFLOW_DB_PASSWORD}@postgres-airflow:5432/${AIRFLOW_DB_NAME}
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    # En false para que el DAG quede activo apenas se levanta el entorno,
+    # sin tener que despausarlo a mano en la UI.
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
+    # Para que "from etl.xxx import ..." funcione dentro de los DAGs (etl/ se monta como volumen abajo).
+    PYTHONPATH: /opt/airflow
+    # Instala estas librerias dentro del contenedor al arrancar (no hace falta build de imagen propia).
+    _PIP_ADDITIONAL_REQUIREMENTS: ${AIRFLOW_PIP_ADDITIONAL_REQUIREMENTS}
+    # Airflow Connection hacia el repositorio analitico, inyectada por variable de entorno
+    # (AIRFLOW_CONN_<conn_id>) en vez de crearla a mano en la UI. Apunta al servidor remoto,
+    # no al postgres-dwh local (ver servicio dwh-remote-init mas abajo).
+    AIRFLOW_CONN_DWH_POSTGRES: postgresql://${REMOTE_DWH_USER}:${REMOTE_DWH_PASSWORD}@${REMOTE_DWH_HOST}:${REMOTE_DWH_PORT}/${REMOTE_DWH_NAME}
+    # Airflow Variables (parametros operativos del pipeline), mismo mecanismo de variable de entorno.
+    AIRFLOW_VAR_RAW_DATA_PATH: /opt/airflow/data/raw
+    AIRFLOW_VAR_CATEGORY_KEYWORDS_PATH: /opt/airflow/etl/category_keywords.json
+  volumes:
+    - ./airflow/dags:/opt/airflow/dags
+    - ./etl:/opt/airflow/etl
+    - ./data:/opt/airflow/data
+    - airflow_logs:/opt/airflow/logs
+  depends_on:
+    postgres-airflow:
+      condition: service_healthy
+    # Que el repositorio analitico remoto ya tenga sus tablas creadas antes de que
+    # Airflow intente correr cualquier tarea que dependa de el.
+    dwh-remote-init:
+      condition: service_completed_successfully
+
+services:
+  # Base de datos de metadatos internos de Airflow (DAGs, runs, logs, usuarios...).
+  # Separada del repositorio analitico, tal como exige el enunciado.
+  postgres-airflow:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: ${AIRFLOW_DB_USER}
+      POSTGRES_PASSWORD: ${AIRFLOW_DB_PASSWORD}
+      POSTGRES_DB: ${AIRFLOW_DB_NAME}
+    volumes:
+      - postgres_airflow_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${AIRFLOW_DB_USER}"]
+      interval: 5s
+      retries: 10
+
+  # Fallback/respaldo local: NO es el destino real del pipeline (ver dwh-remote-init).
+  # Util solo para probar el modelo offline si el servidor remoto no esta disponible.
+  postgres-dwh:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: ${DWH_DB_USER}
+      POSTGRES_PASSWORD: ${DWH_DB_PASSWORD}
+      POSTGRES_DB: ${DWH_DB_NAME}
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_dwh_data:/var/lib/postgresql/data
+      - ./sql/ddl:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DWH_DB_USER}"]
+      interval: 5s
+      retries: 10
+
+  # Crea la base de datos y los esquemas/tablas (sql/ddl/*.sql) en el servidor
+  # PostgreSQL remoto. Corre una vez al levantar el entorno y termina (es
+  # idempotente: CREATE DATABASE solo si no existe, DDL con IF NOT EXISTS).
+  dwh-remote-init:
+    image: postgres:16
+    environment:
+      PGPASSWORD: ${REMOTE_DWH_PASSWORD}
+      REMOTE_DWH_HOST: ${REMOTE_DWH_HOST}
+      REMOTE_DWH_PORT: ${REMOTE_DWH_PORT}
+      REMOTE_DWH_USER: ${REMOTE_DWH_USER}
+      REMOTE_DWH_NAME: ${REMOTE_DWH_NAME}
+    volumes:
+      - ./sql/ddl:/sql/ddl:ro
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        set -e
+        until psql -h "$$REMOTE_DWH_HOST" -p "$$REMOTE_DWH_PORT" -U "$$REMOTE_DWH_USER" -d postgres -c '\q'; do
+          echo "Esperando conexion al servidor remoto $$REMOTE_DWH_HOST:$$REMOTE_DWH_PORT..."
+          sleep 2
+        done
+        EXISTS=$$(psql -h "$$REMOTE_DWH_HOST" -p "$$REMOTE_DWH_PORT" -U "$$REMOTE_DWH_USER" -d postgres -tAc \
+          "SELECT 1 FROM pg_database WHERE datname = '$$REMOTE_DWH_NAME'")
+        if [ "$$EXISTS" != "1" ]; then
+          echo "Creando base $$REMOTE_DWH_NAME..."
+          psql -h "$$REMOTE_DWH_HOST" -p "$$REMOTE_DWH_PORT" -U "$$REMOTE_DWH_USER" -d postgres -c "CREATE DATABASE $$REMOTE_DWH_NAME"
+        fi
+        for f in /sql/ddl/*.sql; do
+          echo "Ejecutando $$f"
+          psql -h "$$REMOTE_DWH_HOST" -p "$$REMOTE_DWH_PORT" -U "$$REMOTE_DWH_USER" -d "$$REMOTE_DWH_NAME" -v ON_ERROR_STOP=1 -f "$$f"
+        done
+
+  # Corre una sola vez: crea/migra las tablas de metadatos de Airflow y el usuario
+  # administrador (con esto la UI ya tiene login listo, sin pasos manuales). Termina y sale.
+  airflow-init:
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db migrate
+        airflow users create \
+          --username "$${AIRFLOW_ADMIN_USER}" \
+          --password "$${AIRFLOW_ADMIN_PASSWORD}" \
+          --firstname Admin --lastname Admin --role Admin \
+          --email admin@example.com || true
+    environment:
+      <<: *airflow-common-env
+      AIRFLOW_ADMIN_USER: ${AIRFLOW_ADMIN_USER}
+      AIRFLOW_ADMIN_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD}
+
+  # UI/API en http://localhost:8080. No ejecuta tareas (eso lo hace el scheduler).
+  airflow-webserver:
+    <<: *airflow-common
+    command: webserver
+    ports:
+      - "8080:8080"
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+  # Detecta el DAG en airflow/dags/ y ejecuta sus tareas (LocalExecutor: las corre el mismo contenedor).
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+volumes:
+  postgres_airflow_data:
+  postgres_dwh_data:
+  airflow_logs:
